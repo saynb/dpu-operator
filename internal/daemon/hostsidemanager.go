@@ -6,43 +6,42 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	cni100 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/go-logr/logr"
-	configv1 "github.com/openshift/dpu-operator/api/v1"
 	"github.com/openshift/dpu-operator/dpu-cni/pkgs/cniserver"
 	"github.com/openshift/dpu-operator/dpu-cni/pkgs/cnitypes"
 	"github.com/openshift/dpu-operator/dpu-cni/pkgs/sriov"
 	deviceplugin "github.com/openshift/dpu-operator/internal/daemon/device-plugin"
 	"github.com/openshift/dpu-operator/internal/daemon/plugin"
 	sfcreconciler "github.com/openshift/dpu-operator/internal/daemon/sfc-reconciler"
+	"github.com/openshift/dpu-operator/internal/scheme"
 	"github.com/openshift/dpu-operator/internal/utils"
 	pb "github.com/opiproject/opi-api/network/evpn-gw/v1alpha1/gen/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 )
 
 type HostSideManager struct {
-	dev         bool
-	log         logr.Logger
-	conn        *grpc.ClientConn
-	client      pb.BridgePortServiceClient
-	vsp         plugin.VendorPlugin
-	dp          deviceplugin.DevicePlugin
-	addr        string
-	port        int32
-	cniserver   *cniserver.Server
-	sm          sriov.Manager
-	manager     ctrl.Manager
-	startedWg   sync.WaitGroup
-	pathManager utils.PathManager
+	dev           bool
+	log           logr.Logger
+	conn          *grpc.ClientConn
+	client        pb.BridgePortServiceClient
+	config        *rest.Config
+	vsp           plugin.VendorPlugin
+	dp            deviceplugin.DevicePlugin
+	addr          string
+	port          int32
+	cniserver     *cniserver.Server
+	sm            sriov.Manager
+	manager       ctrl.Manager
+	startedWg     sync.WaitGroup
+	pathManager   utils.PathManager
+	stopRequested bool
+	dpListener    net.Listener
 }
 
 func (d *HostSideManager) CreateBridgePort(pf int, vf int, vlan int, mac string) (*pb.BridgePort, error) {
@@ -81,24 +80,42 @@ func (d *HostSideManager) DeleteBridgePort(pf int, vf int, vlan int, mac string)
 	return err
 }
 
-func NewHostSideManager(vsp plugin.VendorPlugin, dp deviceplugin.DevicePlugin) *HostSideManager {
-	return &HostSideManager{
-		vsp:         vsp,
-		dp:          dp,
-		log:         ctrl.Log.WithName("HostDaemon"),
-		sm:          sriov.NewSriovManager(),
-		pathManager: *utils.NewPathManager("/"),
+func NewHostSideManager(vsp plugin.VendorPlugin, opts ...func(*HostSideManager)) *HostSideManager {
+	h := &HostSideManager{
+		vsp:           vsp,
+		log:           ctrl.Log.WithName("HostDaemon"),
+		sm:            sriov.NewSriovManager(),
+		pathManager:   *utils.NewPathManager("/"),
+		stopRequested: false,
+	}
+
+	for _, opt := range opts {
+		opt(h)
+	}
+
+	h.dp = deviceplugin.NewDevicePlugin(vsp, false, h.pathManager)
+	if h.config == nil {
+		h.config = ctrl.GetConfigOrDie()
+	}
+	return h
+}
+
+func WithPathManager2(pathManager *utils.PathManager) func(*HostSideManager) {
+	return func(d *HostSideManager) {
+		d.pathManager = *pathManager
 	}
 }
 
-func (d *HostSideManager) WithPathManager(pathManager *utils.PathManager) *HostSideManager {
-	d.pathManager = *pathManager
-	return d
+func WithSriovManager(manager sriov.Manager) func(*HostSideManager) {
+	return func(d *HostSideManager) {
+		d.sm = manager
+	}
 }
 
-func (d *HostSideManager) WithSriovManager(manager sriov.Manager) *HostSideManager {
-	d.sm = manager
-	return d
+func WithClient(client *rest.Config) func(*HostSideManager) {
+	return func(d *HostSideManager) {
+		d.config = client
+	}
 }
 
 func (d *HostSideManager) WithManager(manager ctrl.Manager) *HostSideManager {
@@ -179,6 +196,7 @@ func (d *HostSideManager) Listen() (net.Listener, error) {
 	d.startedWg.Add(1)
 	d.log.Info("Starting HostDaemon", "devflag", d.dev, "cniServerPath", d.pathManager.CNIServerPath())
 
+	d.setupReconcilers()
 	addr, port, err := d.vsp.Start()
 	if err != nil {
 		d.log.Error(err, "VSP init returned error")
@@ -195,13 +213,15 @@ func (d *HostSideManager) Listen() (net.Listener, error) {
 	}
 
 	d.cniserver = cniserver.NewCNIServer(add, del, cniserver.WithPathManager(d.pathManager))
+	d.dpListener, err = d.dp.Listen()
+	if err != nil {
+		return nil, fmt.Errorf("HostSideManager Failed to Listen while calling device plugin listen: %v", err)
+	}
 
 	return d.cniserver.Listen()
 }
 
 func (d *HostSideManager) ListenAndServe() error {
-	var wg sync.WaitGroup
-	done := make(chan error, 3)
 	listener, err := d.Listen()
 
 	if err != nil {
@@ -209,32 +229,39 @@ func (d *HostSideManager) ListenAndServe() error {
 		return err
 	}
 
+	return d.Serve(listener)
+}
+
+func (d *HostSideManager) Serve(listener net.Listener) error {
+	var wg sync.WaitGroup
+	var err error
+	done := make(chan error, 3)
 	wg.Add(1)
 	go func() {
 		d.log.Info("Starting CNI server")
-		if err := d.Serve(listener); err != nil {
+		if err := d.cniserver.Serve(listener); err != nil {
 			done <- err
 		} else {
 			done <- nil
 		}
-		d.log.Info("Stopping CNI server")
+		d.log.Info("Stopped CNI server")
 		wg.Done()
 	}()
 
 	wg.Add(1)
 	go func() {
 		d.log.Info("Starting Device Plugin server")
-		if err := d.dp.ListenAndServe(); err != nil {
+		if err := d.dp.Serve(d.dpListener); err != nil {
 			done <- err
 		} else {
 			done <- nil
 		}
-		d.log.Info("Stopping Device Plugin server")
+		d.log.Info("Stopped Device Plugin server")
 		wg.Done()
 	}()
 
-	d.setupReconcilers()
-	ctx, cancelManager := context.WithCancel(ctrl.SetupSignalHandler())
+	ctx, cancelManager := utils.CancelFunc()
+
 	wg.Add(1)
 	go func() {
 		d.log.Info("Starting manager")
@@ -243,7 +270,7 @@ func (d *HostSideManager) ListenAndServe() error {
 		} else {
 			done <- nil
 		}
-		d.log.Info("Stopping manager")
+		d.log.Info("Stopped manager")
 		wg.Done()
 	}()
 
@@ -251,48 +278,38 @@ func (d *HostSideManager) ListenAndServe() error {
 	// are forced to exit.
 	err = <-done
 
-	cancelManager()
-	d.dp.Stop()
 	d.cniserver.Shutdown(context.TODO())
+	d.dp.Stop()
+	cancelManager()
 	wg.Wait()
+	d.startedWg.Done()
 
+	if d.stopRequested {
+		err = nil
+	}
 	return err
 }
 
-func (d *HostSideManager) Serve(listener net.Listener) error {
-	defer d.startedWg.Done()
-	err := d.cniserver.Serve(listener)
-	if err != nil {
-		d.log.Error(err, "Error from CNI server while serving shim")
-		return err
-	}
-	return nil
-}
-
 func (d *HostSideManager) Stop() {
+	d.log.Info("Stopping HostSideManager")
+	d.stopRequested = true
 	if d.cniserver != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-		defer cancel()
-		d.cniserver.Shutdown(ctx)
+		d.cniserver.ShutdownAndWait()
 		d.startedWg.Wait()
 		d.cniserver = nil
 	}
+	d.log.Info("Stopped HostSideManager")
 }
 
 var (
-	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
 
-func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(configv1.AddToScheme(scheme))
-}
-
 func (d *HostSideManager) setupReconcilers() {
+	d.log.Info("HostSideManager.setupReconcilers()")
 	if d.manager == nil {
-		mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-			Scheme: scheme,
+		mgr, err := ctrl.NewManager(d.config, ctrl.Options{
+			Scheme: scheme.Scheme,
 			NewCache: func(config *rest.Config, opts cache.Options) (cache.Cache, error) {
 				opts.DefaultNamespaces = map[string]cache.Config{
 					"openshift-dpu-operator": {},

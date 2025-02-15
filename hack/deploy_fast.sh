@@ -19,8 +19,8 @@ deploy_cluster_and_dpu_operator() {
 }
 
 deploy_local_dpu_operator() {
-    bash hack/ipu_host_deploy_post.sh
-    bash hack/ipu_deploy_post.sh
+    bash hack/dpu_host_deploy_post.sh
+    bash hack/dpu_deploy_post.sh
 }
 
 result_ocp=0
@@ -38,4 +38,4 @@ else
     deploy_cluster_and_dpu_operator
 fi
 
-bash hack/deploy_traffic_flow_tests.sh
+bash hack/traffic_flow_tests.sh

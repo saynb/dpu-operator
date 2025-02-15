@@ -89,31 +89,32 @@ endif
 deploy_clusters: prepare-e2e-test
 	hack/both.sh
 
-.PHONY: deploy_tft_tests
-deploy_tft_tests:
-	hack/deploy_traffic_flow_tests.sh
+.PHONY: traffic-flow-tests
+traffic-flow-tests:
+	hack/traffic_flow_tests.sh
 
 .PHONY: fast_e2e_test
 fast_e2e_test: prepare-e2e-test
 	hack/deploy_fast.sh
 
 .PHONY: e2e_test
-e2e-test: deploy_clusters e2e-test-suite deploy_tft_tests
+e2e-test: deploy_clusters e2e-test-suite traffic-flow-tests
 	@echo "E2E Test Completed"
 
-.PHONY: redeploy
-redeploy:
-	 -$(MAKE) undeploy
-	 $(MAKE) local-buildx
-	 $(MAKE) local-pushx
-	 $(MAKE) local-deploy
-	 @echo "redeployed"
+.PHONY: redeploy-both-incremental
+redeploy-both-incremental:
+	$(MAKE) local-pushx-incremental
+	KUBECONFIG=/root/kubeconfig.microshift $(MAKE) local-deploy
+	KUBECONFIG=/root/kubeconfig.microshift oc create -f examples/dpu.yaml
+	KUBECONFIG=/root/kubeconfig.ocpcluster $(MAKE) local-deploy
+	KUBECONFIG=/root/kubeconfig.ocpcluster oc create -f examples/host.yaml
 
 .PHONY: redeploy-both
 redeploy-both:
-	KUBECONFIG=/root/kubeconfig.microshift make redeploy
+	$(MAKE) local-pushx
+	KUBECONFIG=/root/kubeconfig.microshift $(MAKE) local-deploy
 	KUBECONFIG=/root/kubeconfig.microshift oc create -f examples/dpu.yaml
-	KUBECONFIG=/root/kubeconfig.ocpcluster make redeploy
+	KUBECONFIG=/root/kubeconfig.ocpcluster $(MAKE) local-deploy
 	KUBECONFIG=/root/kubeconfig.ocpcluster oc create -f examples/host.yaml
 
 .PHONY: all
@@ -201,7 +202,7 @@ check-podman:
 
 .PHONY: test
 test: podman-check manifests generate fmt vet envtest ginkgo
-	FAST_TEST=false KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GINKGO) --repeat 4 $(if $(TEST_FOCUS),-focus $(TEST_FOCUS),) ./internal/... -coverprofile cover.out
+	FAST_TEST=false KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" timeout 30m $(GINKGO) --repeat 4 $(if $(TEST_FOCUS),-focus $(TEST_FOCUS),) ./internal/... -coverprofile cover.out
 
 .PHONY: fast-test
 fast-test: envtest ginkgo
@@ -268,18 +269,26 @@ prep-local-deploy: tools
 	./bin/config -registry-url $(REGISTRY) -template-file config/dev/local-images-template.yaml -output-file bin/local-images.yaml
 	cp config/dev/kustomization.yaml bin
 
-.PHONY: incremental-local-deploy-prep
+.PHONY: incremental-prep-local-deploy
 incremental-prep-local-deploy: tools
 	./bin/config -registry-url $(REGISTRY) -template-file config/incremental/local-images-template.yaml -output-file bin/local-images.yaml
 	cp config/dev/kustomization.yaml bin
 
 .PHONY: local-deploy
 local-deploy: prep-local-deploy tools manifests kustomize ## Deploy controller with images hosted on local registry
+	-$(MAKE) undeploy
 	$(KUSTOMIZE) build bin | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+	@echo "Waiting for namespace 'openshift-dpu-operator' to be removed..."
+	@while $(KUBECTL) get ns openshift-dpu-operator >/dev/null 2>&1; do \
+		echo "Namespace still exists... waiting"; \
+		sleep 5; \
+	done
+	@echo "Namespace 'openshift-dpu-operator' has been removed."
+
 
 .PHONY: local-build
 local-build: ## Build all container images necessary to run the whole operator
@@ -327,7 +336,7 @@ local-buildx-intel-vsp: prepare-multi-arch go-cache
 
 TMP_FILE=/tmp/dpu-operator-incremental-build
 define build_image_incremental
-    bin/incremental -dockerfile $(2) -base-uri $($(1)) -output-file $(TMP_FILE)
+    bin/incremental -dockerfile $(2) -base-uri $($(1))-base -output-file $(TMP_FILE)
     # Pass the newly generated Dockerfile to build_image
     $(call build_image,$(1),$(TMP_FILE))
 endef
@@ -336,33 +345,39 @@ endef
 ## It only makes sense to use this target after you've called local-buildx at
 ## least once.
 .PHONY: local-buildx-incremental-manager
-local-buildx-incremental-manager: prepare-multi-arch go-cache
+local-buildx-incremental-manager: tools prepare-multi-arch go-cache
 	GOARCH=arm64 $(MAKE) build-manager
 	GOARCH=amd64 $(MAKE) build-manager
 	$(call build_image_incremental,DPU_OPERATOR_IMAGE,Dockerfile.rhel)
 
 .PHONY: local-buildx-incremental-daemon
-local-buildx-incremental-daemon: prepare-multi-arch go-cache
+local-buildx-incremental-daemon: tools prepare-multi-arch go-cache
 	GOARCH=amd64 $(MAKE) build-daemon
 	GOARCH=arm64 $(MAKE) build-daemon
 	$(call build_image_incremental,DPU_DAEMON_IMAGE,Dockerfile.daemon.rhel)
 
 .PHONY: local-buildx-incremental-marvell-vsp
-local-buildx-incremental-marvell-vsp: prepare-multi-arch go-cache
+local-buildx-incremental-marvell-vsp: tools prepare-multi-arch go-cache
 	GOARCH=arm64 $(MAKE) build-marvell-vsp
 	GOARCH=amd64 $(MAKE) build-marvell-vsp
 	$(call build_image_incremental,MARVELL_VSP_IMAGE,Dockerfile.mrvlVSP.rhel)
 
 .PHONY: local-buildx-incremental-intel-vsp
+local-buildx-incremental-intel-vsp: prepare-multi-arch go-cache
 	GOARCH=arm64 $(MAKE) build-intel-vsp
 	GOARCH=amd64 $(MAKE) build-intel-vsp
-local-buildx-incremental-intel-vsp: prepare-multi-arch go-cache
 	$(call build_image_incremental,INTEL_VSP_IMAGE,Dockerfile.IntelVSP.rhel)
 
-
 .PHONY: incremental-local-buildx
-incremental-local-buildx: prepare-multi-arch go-cache incremental-prep-local-deploy build-both
+incremental-local-buildx: prepare-multi-arch go-cache incremental-prep-local-deploy local-buildx-incremental-manager local-buildx-incremental-daemon local-buildx-incremental-marvell-vsp local-buildx-incremental-intel-vsp
 	@echo "local-buildx-incremental completed"
+
+.PHONY: local-pushx-incremental
+local-pushx-incremental: ## Push all container images necessary to run the whole operator
+	buildah manifest push --all $(DPU_OPERATOR_IMAGE)-manifest docker://$(DPU_OPERATOR_IMAGE)
+	buildah manifest push --all $(DPU_DAEMON_IMAGE)-manifest docker://$(DPU_DAEMON_IMAGE)
+	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)
+	buildah manifest push --all $(INTEL_VSP_IMAGE)-manifest docker://$(INTEL_VSP_IMAGE)
 
 .PHONY: local-pushx
 local-pushx: ## Push all container images necessary to run the whole operator
@@ -370,7 +385,11 @@ local-pushx: ## Push all container images necessary to run the whole operator
 	buildah manifest push --all $(DPU_DAEMON_IMAGE)-manifest docker://$(DPU_DAEMON_IMAGE)
 #	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)
 	buildah manifest push --all $(INTEL_VSP_IMAGE)-manifest docker://$(INTEL_VSP_IMAGE)
-
+	buildah manifest push --all $(DPU_OPERATOR_IMAGE)-manifest docker://$(DPU_OPERATOR_IMAGE)-base
+	buildah manifest push --all $(DPU_DAEMON_IMAGE)-manifest docker://$(DPU_DAEMON_IMAGE)-base
+	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)-base
+	buildah manifest push --all $(INTEL_VSP_IMAGE)-manifest docker://$(INTEL_VSP_IMAGE)-base
+	
 .PHONY: local-push
 local-push: ## Push all container images necessary to run the whole operator
 	$(CONTAINER_TOOL) push $(DPU_OPERATOR_IMAGE)

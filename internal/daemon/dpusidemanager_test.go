@@ -3,13 +3,13 @@ package daemon
 import (
 	"context"
 	"os"
+	"time"
 
 	g "github.com/onsi/ginkgo/v2"
 	"k8s.io/client-go/rest"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	dpudevicehandler "github.com/openshift/dpu-operator/internal/daemon/device-handler/dpu-device-handler"
 	deviceplugin "github.com/openshift/dpu-operator/internal/daemon/device-plugin"
 	"github.com/openshift/dpu-operator/internal/daemon/plugin"
 	mockvsp "github.com/openshift/dpu-operator/internal/daemon/vendor-specific-plugins/mock-vsp"
@@ -22,7 +22,11 @@ import (
 func waitAllNodesDpuAllocatable(client client.Client) {
 	var nodes corev1.NodeList
 	Eventually(func() error {
-		return client.List(context.Background(), &nodes)
+		// Call to client might hang if we don't put a bound on how long it can run
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		return client.List(ctx, &nodes)
 	}, testutils.TestAPITimeout, testutils.TestRetryInterval).Should(Succeed())
 
 	Eventually(func() bool {
@@ -68,13 +72,7 @@ var _ = g.Describe("DPU side maanger", Ordered, func() {
 		dpuPlugin := plugin.NewGrpcPlugin(true,
 			client,
 			plugin.WithPathManager(pathManager))
-		dpuDeviceHandler := dpudevicehandler.NewDpuDeviceHandler(
-			dpudevicehandler.WithPathManager(pathManager),
-			dpudevicehandler.WithDpuMode(true))
-		dp := deviceplugin.NewDevicePlugin(dpuDeviceHandler,
-			deviceplugin.WithPathManager(pathManager))
-		dpuDaemon = NewDpuSideManger(dpuPlugin, dp, config,
-			WithPathManager(pathManager))
+		dpuDaemon = NewDpuSideManger(dpuPlugin, config, WithPathManager(pathManager))
 
 		dpuListen, err := dpuDaemon.Listen()
 		Expect(err).NotTo(HaveOccurred())

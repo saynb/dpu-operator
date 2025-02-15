@@ -47,7 +47,7 @@ type LifeCycleServiceServer struct {
 	daemonIpuIp  string
 	daemonPort   int
 	mode         string
-	p4rtbin      string
+	p4rtClient   types.P4RTClient
 	bridgeCtlr   types.BridgeController
 	initialized  bool // Currently, can only call initiliaze once
 }
@@ -78,13 +78,13 @@ const (
 var AccIntfNames = [ApfNumber]string{"enp0s1f0", "enp0s1f0d1", "enp0s1f0d2", "enp0s1f0d3", "enp0s1f0d4", "enp0s1f0d5", "enp0s1f0d6",
 	"enp0s1f0d7", "enp0s1f0d8", "enp0s1f0d9", "enp0s1f0d10", "enp0s1f0d11", "enp0s1f0d12", "enp0s1f0d13", "enp0s1f0d14", "enp0s1f0d15"}
 
-func NewLifeCycleService(daemonHostIp, daemonIpuIp string, daemonPort int, mode string, p4rtbin string, brCtlr types.BridgeController) *LifeCycleServiceServer {
+func NewLifeCycleService(daemonHostIp, daemonIpuIp string, daemonPort int, mode string, p4rtClient types.P4RTClient, brCtlr types.BridgeController) *LifeCycleServiceServer {
 	return &LifeCycleServiceServer{
 		daemonHostIp: daemonHostIp,
 		daemonIpuIp:  daemonIpuIp,
 		daemonPort:   daemonPort,
 		mode:         mode,
-		p4rtbin:      p4rtbin,
+		p4rtClient:   p4rtClient,
 		bridgeCtlr:   brCtlr,
 		initialized:  false,
 	}
@@ -136,7 +136,7 @@ type SSHHandler interface {
 type SSHHandlerImpl struct{}
 
 type FXPHandler interface {
-	configureFXP(p4rtbin string, brCtlr types.BridgeController) error
+	configureFXP(p4rtClient types.P4RTClient, brCtlr types.BridgeController) error
 }
 
 type FXPHandlerImpl struct{}
@@ -687,7 +687,7 @@ func countAPFDevices() int {
 Updates post_init_app.sh script, which installs
 port-setup.sh script. port-setup.sh script,
 will run devmem command for D5 interface, as soon as
-D5 comes up on ACC, to enable connectivity. 
+D5 comes up on ACC, to enable connectivity.
 There is an intermittent race condition, when port-setup.log file, is
 accessed(for file removal or any other case) by post_init_app.sh,
 then later when nohup tries to stdout to that log file(port-setup.log),
@@ -696,9 +696,14 @@ In order to circumvent this, just allowing nohup to over-write port-setup.log.
 Also, to make this more robust, added polling in post-init-app.sh, to check for
 log(and if not present within 10 secs), we start second instance of port-setup.sh.
 So, at the most, we would run port-setup.sh twice.
-Running devmem commands thro locking mechanism, so the devmem commands are 
+Running devmem commands thro locking mechanism, so the devmem commands are
 run in critical section, so that devmem commands are run sequentially,
 when port-setup.sh gets run concurrently.
+Note: In order to handle RHEL ISO install use-case, where ACC reboots(post install),
+independant of IMC, port-setup script will be running
+as daemon, so anytime ACC goes down(it will get detected), so that devmem commands
+will get re-run, when ACC comes up. Based on design, atleast 1 or utmost 2 instances
+of port-setup can be running as daemon.
 */
 func postInitAppScript() string {
 
@@ -720,12 +725,21 @@ pkill -9 $(basename ${PORT_SETUP_SCRIPT})
 
 cat<<PORT_CONFIG_EOF > ${PORT_SETUP_SCRIPT}
 #!/bin/bash
-set -x
 IDPF_VPORT_NAME="enp0s1f0d5"
 ACC_VPORT_ID=0x5
 retry=0
+ran_cmds=0
+ran_cmds_cnt=0
+ran_cmds_cnt_max=2147483647 # Max value for 32-bit signed integer
 
-echo "random_num(for unique port-setup.log):"$(od -An -N8 -i /dev/urandom)
+# Set max size of log file (bytes)
+MAX_LOG_SIZE=1048576
+# Log file to check
+LOG_FILE=\${1}
+
+echo "LOG_FILE->:"\${LOG_FILE}
+
+echo "random_num(for unique port-setup.log):"\$(od -An -N8 -i /dev/urandom)
 
 LOCKFILE=/tmp/mylockfile
 
@@ -737,7 +751,10 @@ release_lock() {
 # Set up the trap to release the lock on exit
 trap release_lock EXIT
 
-while true ; do
+# Function to invoke devmem commands
+run_devmem_cmds() {
+retry=0
+while [[ \${ran_cmds} -eq 0 ]] ; do
 sleep 2
 cli_entry=(\$(cli_client -qc | grep "fn_id: 0x4 .* vport_id \${ACC_VPORT_ID}" | sed 's/: / /g' | sed 's/addr //g'))
 if [ \${#cli_entry[@]} -gt 1 ] ; then
@@ -754,17 +771,25 @@ if [ \${#cli_entry[@]} -gt 1 ] ; then
                 echo "#Add to VSI Group 1 :  \${IDPF_VPORT_NAME} [vsi: \${IDPF_VPORT_VSI_HEX}]"
                 # Try to acquire the lock
                 while true ; do
-                if ( set -o noclobber; echo $$ > \${LOCKFILE} ) 2>/dev/null; then
+                if ( set -o noclobber; echo \$$ > \${LOCKFILE} ) 2>/dev/null; then
                   echo "RunDevMemCmds_Start: LogFile->"
                   # Critical section - only one script can be here at a time
+                  set -x
                   devmem 0x20292002a0 64 \${VSI_GROUP_INIT}
                   devmem 0x2029200388 64 0x1
                   devmem 0x20292002a0 64 \${VSI_GROUP_WRITE}
+                  set +x
                   sync
-                  echo "RunDevMemCmds_End: LogFile->"
+                  if [ \${ran_cmds_cnt} -eq  \${ran_cmds_cnt_max} ]; then
+                     echo "ran_cmds_cnt has reached maximum value, reset"
+                     ran_cmds_cnt=0
+                  fi
+                  ran_cmds_cnt=\$((ran_cmds_cnt+1))
+                  echo "RunDevMemCmds_End: LogFile, ran_cmds_cnt->"\${ran_cmds_cnt}
                   # Release the lock
-                  rm \${LOCKFILE}
-                  exit 0
+                  release_lock
+                  ran_cmds=1
+                  break
                 else
                   echo "RunDevMemCmds: Needs to wait,sleep"
                   sleep 1
@@ -776,10 +801,50 @@ else
         echo "RETRY: \${retry} : #Add to VSI Group 1 :  \${IDPF_VPORT_NAME} .. "
 fi
 done
+}
+
+# Function to check if D5 interface is up on ACC
+d5_interface_up() {
+  cli_entry=(\$(cli_client -qc | grep "fn_id: 0x4 .* vport_id \${ACC_VPORT_ID}" | sed 's/: / /g' | sed 's/addr //g'))
+  if [ \${#cli_entry[@]} -gt 1 ] ; then
+   return 1  # Success
+  fi
+  return 0
+}
+
+# Invokes run_devmem_cmds, upon startup, and periodically checks if D5 is alive, if not re-run.
+while [[ \${ran_cmds} -eq 0 ]]; do
+   echo "invoke run_devmem_cmds"
+   run_devmem_cmds
+   echo "ran_cmds->"\${ran_cmds}
+
+   #Truncate log, if needed
+   LOG_FILE_SIZE=\$(stat -c %s \${LOG_FILE})
+   # Check if file size exceeds max
+   if [ \${LOG_FILE_SIZE} -gt \${MAX_LOG_SIZE} ]; then
+      echo "File exceeds maximum size. Truncating->"\${LOG_FILE}
+      # Truncate the file, by saving the last 1000 lines
+      X=\$(tail -1000 \${LOG_FILE})
+      echo \${X}>\${LOG_FILE}
+   fi
+
+   #inner while
+   while true ; do
+   d5_interface_up
+   if [[ \$? -eq 1 ]]; then
+      #echo "D5 interface up, sleep"
+      sleep 5
+   else
+      echo "D5 not found. ACC may have gone down, retry."
+      ran_cmds=0
+      break
+   fi
+   done
+done
 PORT_CONFIG_EOF
 
 /usr/bin/chmod a+x ${PORT_SETUP_SCRIPT}
-/usr/bin/nohup bash -c ''"${PORT_SETUP_SCRIPT}"'' 0<&- &> ${PORT_SETUP_LOG} &
+/usr/bin/nohup bash -c ''"${PORT_SETUP_SCRIPT}"' '"${PORT_SETUP_LOG}"'' 0>&- &> ${PORT_SETUP_LOG} &
 
 log_retry=0
 while true ; do
@@ -787,7 +852,7 @@ while true ; do
 if [[ $log_retry -gt 10 ]]; then
    echo "waited for log more than 10 secs, 2nd attempt for port_setup.sh below"
    /usr/bin/chmod a+x ${PORT_SETUP_SCRIPT}
-   /usr/bin/nohup bash -c ''"${PORT_SETUP_SCRIPT}"'' 0<&- &> ${PORT_SETUP_LOG2} &
+   /usr/bin/nohup bash -c ''"${PORT_SETUP_SCRIPT}"' '"${PORT_SETUP_LOG2}"'' 0>&- &> ${PORT_SETUP_LOG2} &
    echo "2nd attempt for port_setup.sh done"
    sleep 1
    sync
@@ -1058,7 +1123,7 @@ func (e *ExecutableHandlerImpl) SetupAccApfs() error {
 // If ipu-plugin's Init function gets invoked on ACC, prior to getting invoked
 // on x86, then host VFs will not be setup yet. In that case, peer2peer rules
 // will get added in CreateBridgePort or CreateNetworkFunction.
-func CheckAndAddPeerToPeerP4Rules(p4rtbin string) {
+func CheckAndAddPeerToPeerP4Rules(p types.P4RTClient) {
 	if !PeerToPeerP4RulesAdded {
 		vfMacList, err := utils.GetVfMacList()
 		if err != nil {
@@ -1069,14 +1134,14 @@ func CheckAndAddPeerToPeerP4Rules(p4rtbin string) {
 		if len(vfMacList) == 0 || (len(vfMacList) == 1 && vfMacList[0] == "") {
 			log.Infof("No VFs initialized on the host yet")
 		} else {
-			log.Infof("AddPeerToPeerP4Rules, path->%s, vfMacList->%v", p4rtbin, vfMacList)
-			p4rtclient.AddPeerToPeerP4Rules(p4rtbin, vfMacList)
+			log.Infof("AddPeerToPeerP4Rules, path->%s, vfMacList->%v", p.GetBin(), vfMacList)
+			p4rtclient.AddPeerToPeerP4Rules(p, vfMacList)
 			PeerToPeerP4RulesAdded = true
 		}
 	}
 }
 
-func (s *FXPHandlerImpl) configureFXP(p4rtbin string, brCtlr types.BridgeController) error {
+func (s *FXPHandlerImpl) configureFXP(p types.P4RTClient, brCtlr types.BridgeController) error {
 	if !InitAccApfMacs {
 		log.Errorf("configureFXP: AccApfs info not set, thro-> SetupAccApfs")
 		return fmt.Errorf("configureFXP: AccApfs info not set, thro-> SetupAccApfs")
@@ -1088,13 +1153,13 @@ func (s *FXPHandlerImpl) configureFXP(p4rtbin string, brCtlr types.BridgeControl
 		return fmt.Errorf("failed to add port to bridge: %v, for interface->%v", err, AccIntfNames[PHY_PORT0_INTF_INDEX])
 	}
 	//Add P4 rules for phy ports
-	log.Infof("AddPhyPortRules, path->%s, 1->%v, 2->%v", p4rtbin, AccApfMacList[PHY_PORT0_INTF_INDEX], AccApfMacList[PHY_PORT1_INTF_INDEX])
-	p4rtclient.AddPhyPortRules(p4rtbin, AccApfMacList[PHY_PORT0_INTF_INDEX], AccApfMacList[PHY_PORT1_INTF_INDEX])
+	log.Infof("AddPhyPortRules, path->%s, 1->%v, 2->%v", p.GetBin(), AccApfMacList[PHY_PORT0_INTF_INDEX], AccApfMacList[PHY_PORT1_INTF_INDEX])
+	p4rtclient.AddPhyPortRules(p, AccApfMacList[PHY_PORT0_INTF_INDEX], AccApfMacList[PHY_PORT1_INTF_INDEX])
 
-	CheckAndAddPeerToPeerP4Rules(p4rtbin)
+	CheckAndAddPeerToPeerP4Rules(p)
 
-	log.Infof("AddLAGP4Rules, path->%v", p4rtbin)
-	p4rtclient.AddLAGP4Rules(p4rtbin)
+	log.Infof("AddLAGP4Rules, path->%v", p.GetBin())
+	p4rtclient.AddLAGP4Rules(p)
 
 	return nil
 }
@@ -1128,7 +1193,7 @@ func (s *LifeCycleServiceServer) Init(ctx context.Context, in *pb.InitRequest) (
 		}
 
 		// Preconfigure the FXP with point-to-point rules between host VFs
-		if err := fxpHandler.configureFXP(s.p4rtbin, s.bridgeCtlr); err != nil {
+		if err := fxpHandler.configureFXP(s.p4rtClient, s.bridgeCtlr); err != nil {
 			return nil, status.Errorf(codes.Internal, "Error when preconfiguring the FXP: %v", err)
 		}
 	}

@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"net"
 
-	dpudevicehandler "github.com/openshift/dpu-operator/internal/daemon/device-handler/dpu-device-handler"
-	deviceplugin "github.com/openshift/dpu-operator/internal/daemon/device-plugin"
 	"github.com/openshift/dpu-operator/internal/platform"
+	"github.com/openshift/dpu-operator/internal/scheme"
 	"github.com/openshift/dpu-operator/internal/utils"
 
 	"github.com/go-logr/logr"
-	"k8s.io/apimachinery/pkg/runtime"
+	"github.com/spf13/afero"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,65 +26,92 @@ type SideManager interface {
 	Stop()
 }
 
-func createDaemon(dpuMode bool, config *rest.Config, vspImages map[string]string, client client.Client) (SideManager, error) {
-	platform := platform.NewPlatformInfo()
-	plugin, err := platform.VspPlugin(dpuMode, vspImages, client)
-	if err != nil {
-		return nil, err
-	}
-
-	deviceHandler := dpudevicehandler.NewDpuDeviceHandler(dpudevicehandler.WithDpuMode(dpuMode))
-	dp := deviceplugin.NewDevicePlugin(deviceHandler)
-
-	if dpuMode {
-		return NewDpuSideManger(plugin, dp, config), nil
-	} else {
-		return NewHostSideManager(plugin, dp), nil
-	}
-}
-
 type Daemon struct {
-	client    client.Client
 	mode      string
 	pm        *utils.PathManager
 	log       logr.Logger
 	vspImages map[string]string
 	config    *rest.Config
+	mgr       SideManager
+	client    client.Client
+	fs        afero.Fs
 }
 
-func NewDaemon(mode string, client client.Client, scheme *runtime.Scheme, vspImages map[string]string, config *rest.Config) Daemon {
+func NewDaemon(fs afero.Fs, mode string, config *rest.Config, vspImages map[string]string, pathManager *utils.PathManager) Daemon {
 	log := ctrl.Log.WithName("Daemon")
 	return Daemon{
-		client:    client,
+		fs:        fs,
 		mode:      mode,
-		pm:        utils.NewPathManager("/"),
+		pm:        pathManager,
 		log:       log,
 		vspImages: vspImages,
 		config:    config,
 	}
 }
 
-func (d *Daemon) Run() error {
+func (d *Daemon) ListenAndServe() error {
+	listener, err := d.Listen()
+
+	if err != nil {
+		d.log.Error(err, "Failed to listen")
+		return err
+	}
+
+	return d.Serve(listener)
+}
+
+func (d *Daemon) Listen() (net.Listener, error) {
+	var err error
+	d.client, err = client.New(d.config, client.Options{
+		Scheme: scheme.Scheme,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create client: %v", err)
+	}
+
 	ce := utils.NewClusterEnvironment(d.client)
 	flavour, err := ce.Flavour(context.TODO())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	d.log.Info("Detected OpenShift", "flavour", flavour)
+	d.log.Info("Detected Kuberentes flavour", "flavour", flavour)
 	err = d.prepareCni(flavour)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	dpuMode, err := d.isDpuMode()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	daemon, err := createDaemon(dpuMode, d.config, d.vspImages, d.client)
+	d.mgr, err = d.createDaemon(dpuMode, d.config, d.vspImages, d.client)
 	if err != nil {
 		d.log.Error(err, "Failed to start daemon")
-		return err
+		return nil, err
 	}
-	return daemon.ListenAndServe()
+	return d.mgr.Listen()
+}
+
+func (d *Daemon) Serve(listener net.Listener) error {
+	return d.mgr.Serve(listener)
+}
+
+func (d *Daemon) Stop() {
+	d.mgr.Stop()
+}
+
+func (d *Daemon) createDaemon(dpuMode bool, config *rest.Config, vspImages map[string]string, client client.Client) (SideManager, error) {
+	platform := platform.NewPlatformInfo()
+	plugin, err := platform.VspPlugin(dpuMode, vspImages, client)
+	if err != nil {
+		return nil, err
+	}
+
+	if dpuMode {
+		return NewDpuSideManger(plugin, config, WithPathManager(*d.pm)), nil
+	} else {
+		return NewHostSideManager(plugin, WithPathManager2(d.pm)), nil
+	}
 }
 
 func (d *Daemon) prepareCni(flavour utils.Flavour) error {
@@ -94,12 +120,12 @@ func (d *Daemon) prepareCni(flavour utils.Flavour) error {
 		d.log.Error(err, "Failed to get cni path")
 		return err
 	}
-	err = utils.CopyFile("/dpu-cni", cniPath)
+
+	err = utils.CopyFile(d.fs, "/dpu-cni", cniPath)
 	if err != nil {
-		d.log.Error(err, "Failed to prepare CNI binary", "path", cniPath)
-		return err
+		return fmt.Errorf("Failed to prepare CNI binary from /dpu-cni to %v", cniPath)
 	}
-	err = utils.MakeExecutable(cniPath)
+	err = utils.MakeExecutable(d.fs, cniPath)
 	if err != nil {
 		return err
 	}
