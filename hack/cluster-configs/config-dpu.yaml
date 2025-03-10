@@ -4,7 +4,7 @@ clusters:
     ingress_vip: "192.168.122.101"
     network_api_port: "{{secondary_network_port()}}"
     kind: "iso"
-    install_iso: "{{iso_server()}}/RHEL-9.6.0-20250130.2-aarch64-dvd1-w-kickstart.iso"
+    install_iso: "{{iso_server()}}/RHEL-9.6.0-20250212.4-aarch64-dvd1-w-kickstart.iso"
     masters:
     - name: "{{worker_number(0)}}-acc"
       node: "localhost"
@@ -12,6 +12,7 @@ clusters:
       bmc:
         url: "{{bmc_hostname(0)}}"
       host_side_bmc: "{{bmc(0)}}"
+      dpu_host: "{{worker_name(0)}}"
       ip: "172.16.3.16"
       mac: "{{DPU_mac_address(0)}}"
     postconfig:

@@ -8,9 +8,12 @@ import (
 	"os"
 
 	"github.com/go-logr/logr"
+	configv1 "github.com/openshift/dpu-operator/api/v1"
 	pb "github.com/openshift/dpu-operator/dpu-api/gen"
+	"github.com/openshift/dpu-operator/internal/scheme"
 	"github.com/openshift/dpu-operator/internal/utils"
 	"github.com/openshift/dpu-operator/pkgs/render"
+	"github.com/openshift/dpu-operator/pkgs/vars"
 	opi "github.com/opiproject/opi-api/network/evpn-gw/v1alpha1/gen/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -24,28 +27,42 @@ var binData embed.FS
 const VspImageIntel string = "IntelVspImage"
 const VspImageMarvell string = "MarvellVspImage"
 
+const VspImageP4Intel string = "IntelVspP4Image"
+
 var VspImages = []string{
 	VspImageIntel,
 	VspImageMarvell,
 	// TODO: Add future supported vendor plugins here
 }
 
-func CreateVspImagesMap(fromEnv bool, logger logr.Logger) map[string]string {
-	vspImages := make(map[string]string)
+var VspExtraData = []string{
+	VspImageP4Intel,
+}
 
-	for _, vspImageName := range VspImages {
+func CreateVspMap(fromEnv bool, logger logr.Logger, VspInfoList []string) map[string]string {
+	vspInfoMap := make(map[string]string)
+
+	for _, vspInfoMapName := range VspInfoList {
 		var value string
 
 		if fromEnv {
-			value = os.Getenv(vspImageName)
+			value = os.Getenv(vspInfoMapName)
 			if value == "" {
-				logger.Info("VspImage env var not set", "VspImage", vspImageName)
+				logger.Info("VspInfoMap env var not set", "VspInfoMap", vspInfoMapName)
 			}
 		}
-		vspImages[vspImageName] = value
+		vspInfoMap[vspInfoMapName] = value
 	}
 
-	return vspImages
+	return vspInfoMap
+}
+
+func CreateVspExtraDataMap(fromEnv bool, logger logr.Logger) map[string]string {
+	return CreateVspMap(fromEnv, logger, VspExtraData)
+}
+
+func CreateVspImagesMap(fromEnv bool, logger logr.Logger) map[string]string {
+	return CreateVspMap(fromEnv, logger, VspImages)
 }
 
 type VendorPlugin interface {
@@ -75,7 +92,7 @@ type GrpcPlugin struct {
 func NewVspTemplateVars() VspTemplateVars {
 	return VspTemplateVars{
 		VendorSpecificPluginImage: "",
-		Namespace:                 "openshift-dpu-operator",
+		Namespace:                 vars.Namespace,
 		ImagePullPolicy:           "Always",
 		Command:                   "[ ]",
 		Args:                      "[ ]",
@@ -131,21 +148,32 @@ func WithVsp(template_vars VspTemplateVars) func(*GrpcPlugin) {
 	}
 }
 
-func (gp *GrpcPlugin) deployVsp() {
+func (gp *GrpcPlugin) deployVsp() error {
 	vspImage := gp.vsp.VendorSpecificPluginImage
 
-	if vspImage != "" {
-		gp.log.Info("Deploying VSP", "vspImage", vspImage, "command", gp.vsp.Command, "args", gp.vsp.Args)
-		err := render.ApplyAllFromBinData(gp.log, "vsp-ds", gp.vsp.ToMap(), binData, gp.k8sClient, nil, nil)
-		if err != nil {
-			gp.log.Error(err, "Failed to start vendor plugin container", "vspImage", gp.vsp.VendorSpecificPluginImage)
-		}
-	} else {
+	// It is not mandatory that a vsp image is provided. If not, we can assume this will be handled by the user and still return a GrpcClient
+	if vspImage == "" {
 		gp.log.Info("WARNING: VSP Image not set, skipping vendor plugin container startup")
+		return nil
 	}
+
+	// Retrieve the Dpu Operator Config which owns the Dpu Daemonset so we can ensure the vsp shares the same owner reference.
+	dpuOperatorConfig := &configv1.DpuOperatorConfig{}
+	err := gp.k8sClient.Get(context.TODO(), client.ObjectKey{Name: vars.DpuOperatorConfigName, Namespace: vars.Namespace}, dpuOperatorConfig)
+	if err != nil {
+		return fmt.Errorf("encountered error when retrieving DpuOperatorConfig %s: %v", vars.DpuOperatorConfigName, err)
+	}
+
+	gp.log.Info("Deploying VSP", "vspImage", vspImage, "command", gp.vsp.Command, "args", gp.vsp.Args)
+	err = render.ApplyAllFromBinData(gp.log, "vsp-ds", gp.vsp.ToMap(), binData, gp.k8sClient, dpuOperatorConfig, scheme.Scheme)
+	if err != nil {
+		return fmt.Errorf("failed to start vendor plugin container (vspImage: %s): %v", vspImage, err)
+	}
+
+	return nil
 }
 
-func NewGrpcPlugin(dpuMode bool, client client.Client, opts ...func(*GrpcPlugin)) *GrpcPlugin {
+func NewGrpcPlugin(dpuMode bool, client client.Client, opts ...func(*GrpcPlugin)) (*GrpcPlugin, error) {
 	gp := &GrpcPlugin{
 		dpuMode:     dpuMode,
 		vsp:         VspTemplateVars{},
@@ -158,9 +186,12 @@ func NewGrpcPlugin(dpuMode bool, client client.Client, opts ...func(*GrpcPlugin)
 		opt(gp)
 	}
 
-	gp.deployVsp()
+	err := gp.deployVsp()
+	if err != nil {
+		return nil, err
+	}
 
-	return gp
+	return gp, nil
 }
 
 func (g *GrpcPlugin) ensureConnected() error {

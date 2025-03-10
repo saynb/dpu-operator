@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	configv1 "github.com/openshift/dpu-operator/api/v1"
 	"github.com/openshift/dpu-operator/internal/controller"
 	"github.com/openshift/dpu-operator/internal/daemon/plugin"
 	"github.com/openshift/dpu-operator/internal/scheme"
@@ -86,6 +87,7 @@ func main() {
 	}
 
 	vspImages := plugin.CreateVspImagesMap(true, setupLog)
+	vspExtraData := plugin.CreateVspExtraDataMap(true, setupLog)
 
 	dpuDaemonImage := os.Getenv("DPU_DAEMON_IMAGE")
 	if dpuDaemonImage == "" {
@@ -93,7 +95,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	b := controller.NewDpuOperatorConfigReconciler(mgr.GetClient(), mgr.GetScheme(), dpuDaemonImage, vspImages)
+	networkResourcesInjectorImage := os.Getenv("NETWORK_RESOURCES_INJECTOR_IMAGE")
+	if networkResourcesInjectorImage == "" {
+		setupLog.Error(err, "Failed to set NETWORK_RESOURCES_INJECTOR_IMAGE env var")
+		os.Exit(1)
+	}
+
+	b := controller.NewDpuOperatorConfigReconciler(mgr.GetClient(), mgr.GetScheme(), dpuDaemonImage, vspImages, vspExtraData, networkResourcesInjectorImage)
 
 	if value, ok := os.LookupEnv("IMAGE_PULL_POLICIES"); ok {
 		b = b.WithImagePullPolicy(value)
@@ -109,6 +117,12 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ServiceFunctionChain")
 		os.Exit(1)
+	}
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err = (&configv1.DpuOperatorConfig{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "DpuOperatorConfig")
+			os.Exit(1)
+		}
 	}
 	//+kubebuilder:scaffold:builder
 

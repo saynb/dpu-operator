@@ -31,13 +31,14 @@ import (
 
 	"github.com/openshift/dpu-operator/internal/daemon/plugin"
 	"github.com/openshift/dpu-operator/internal/testutils"
+	"github.com/openshift/dpu-operator/pkgs/vars"
 
 	configv1 "github.com/openshift/dpu-operator/api/v1"
 )
 
 var (
-	testNamespace              = "openshift-dpu-operator"
-	testDpuOperatorConfigName  = "default"
+	testNamespace              = vars.Namespace
+	testDpuOperatorConfigName  = vars.DpuOperatorConfigName
 	testDpuOperatorConfigKind  = "DpuOperatorConfig"
 	testDpuDaemonName          = "dpu-daemon"
 	testNetworkFunctionNADDpu  = "dpunfcni-conf"
@@ -124,7 +125,7 @@ func startDPUControllerManager(ctx context.Context, client *rest.Config, wg *syn
 	})
 	Expect(err).NotTo(HaveOccurred())
 
-	b := NewDpuOperatorConfigReconciler(mgr.GetClient(), mgr.GetScheme(), "mock-image", plugin.CreateVspImagesMap(false, setupLog))
+	b := NewDpuOperatorConfigReconciler(mgr.GetClient(), mgr.GetScheme(), "mock-image", plugin.CreateVspImagesMap(false, setupLog), plugin.CreateVspExtraDataMap(false, setupLog), "mock-webhook-image")
 	err = b.SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -211,7 +212,7 @@ var _ = Describe("Main Controller", Ordered, func() {
 		Context("When DpuOperatorConfig CR exists with host mode", func() {
 			BeforeAll(func() {
 				ns := dpuOperatorNameSpace()
-				cr = dpuOperatorCR("operator-config", "host", ns)
+				cr = dpuOperatorCR(testDpuOperatorConfigName, "host", ns)
 				createNameSpace(mgr.GetClient(), ns)
 				createDpuOperatorCR(mgr.GetClient(), cr)
 			})
@@ -228,7 +229,7 @@ var _ = Describe("Main Controller", Ordered, func() {
 			})
 			AfterAll(func() {
 				ns := dpuOperatorNameSpace()
-				cr = dpuOperatorCR("operator-config", "host", ns)
+				cr = dpuOperatorCR(testDpuOperatorConfigName, "host", ns)
 				deleteDpuOperatorCR(mgr.GetClient(), cr)
 			})
 		})

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -28,20 +29,21 @@ import (
 )
 
 const (
-	SysBusPci     string = "/sys/bus/pci/devices"
-	VendorID      string = "177d"
-	DPUdeviceID   string = "a0f7"
-	HostDeviceID  string = "b900"
-	DefaultPort   int32  = 8085
-	Version       string = "0.0.1"
-	PortType      string = "veth"
-	NoOfPortPairs int    = 2
-	IPv6AddrDpu   string = "fe80::1"
-	IPv6AddrHost  string = "fe80::2"
-	DataPlaneType string = "debug"
-	NumPFs        int    = 1
-	PFID          int    = 0
-	isDPDK        bool   = false
+	SysBusPci      string = "/sys/bus/pci/devices"
+	VendorID       string = "177d"
+	DPUdeviceID    string = "a0f7"
+	HostDeviceID   string = "b900"
+	DefaultPort    int32  = 8085
+	Version        string = "0.0.1"
+	PortType       string = "veth"
+	NoOfPortPairs  int    = 2
+	IPv6AddrDpu    string = "fe80::1"
+	IPv6AddrHost   string = "fe80::2"
+	DataPlaneType  string = "debug"
+	NumPFs         int    = 1
+	PFID           int    = 0
+	isDPDK         bool   = false
+	HostVFDeviceID string = "b903"
 )
 
 // multiple dataplane can be added using mrvldp interface functions
@@ -53,10 +55,12 @@ type mrvldp interface {
 	DeleteDataplane(bridgeName string) error
 }
 type mrvlDeviceInfo struct {
-	nfInterfaceName string
-	dpInterfaceName string
-	dpMAC           string
-	health          string
+	secInterfaceName string
+	dpInterfaceName  string
+	dpMAC            string
+	portType         string
+	health           string
+	pciAddress       string
 }
 type mrvlVspServer struct {
 	pb.UnimplementedLifeCycleServiceServer
@@ -72,47 +76,60 @@ type mrvlVspServer struct {
 	version       string
 	isDPUMode     bool
 	deviceStore   map[string]mrvlDeviceInfo
-	portType      string
 	noOfPortPairs int
+	portType      string
 	bridgeName    string
 	mrvlDP        mrvldp
 }
 
 // createVethPair function to create a veth pair with the given index and InterfaceInfo
 func (vsp *mrvlVspServer) createVethPair(index int) error {
-	//nfInterfaceName is the name of the interface on the Network Function side
+	//secInterfaceName is the name of the interface on the Network Function side
 	//dpInterfaceName is the name of the interface on the Data Plane side
-	nfInterfaceName := fmt.Sprintf("nf_interface%d", index)
+	secInterfaceName := fmt.Sprintf("nf_interface%d", index)
 	dpInterfaceName := fmt.Sprintf("dp_interface%d", index)
-	vethLink := &netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{Name: nfInterfaceName},
-		PeerName:  dpInterfaceName,
-	}
-	if err := netlink.LinkAdd(vethLink); err != nil {
-		return err
+
+	var nfLink netlink.Link
+	var peerLink netlink.Link
+	var err error
+
+	nfLink, _ = netlink.LinkByName(secInterfaceName)
+	if nfLink != nil {
+		peerLink, _ = netlink.LinkByName(dpInterfaceName)
 	}
 
-	nfLink, err := netlink.LinkByName(nfInterfaceName)
-	if err != nil {
-		return err
+	if nfLink == nil || peerLink == nil {
+		vethLink := &netlink.Veth{
+			LinkAttrs: netlink.LinkAttrs{Name: secInterfaceName},
+			PeerName:  dpInterfaceName,
+		}
+		if err := netlink.LinkAdd(vethLink); err != nil {
+			return err
+		}
+		nfLink, err = netlink.LinkByName(secInterfaceName)
+		if err != nil {
+			return err
+		}
+		peerLink, err = netlink.LinkByName(dpInterfaceName)
+		if err != nil {
+			return err
+		}
 	}
+
 	if err := netlink.LinkSetUp(nfLink); err != nil {
-		return err
-	}
-	peerLink, err := netlink.LinkByName(dpInterfaceName)
-	if err != nil {
 		return err
 	}
 
 	if err := netlink.LinkSetUp(peerLink); err != nil {
 		return err
 	}
-
+	health := vsp.GetDeviceHealth(secInterfaceName)
 	vsp.deviceStore[nfLink.Attrs().HardwareAddr.String()] = mrvlDeviceInfo{
-		nfInterfaceName: nfInterfaceName,
-		dpInterfaceName: dpInterfaceName,
-		dpMAC:           peerLink.Attrs().HardwareAddr.String(),
-		health:          "Healthy",
+		secInterfaceName: secInterfaceName,
+		dpInterfaceName:  dpInterfaceName,
+		dpMAC:            peerLink.Attrs().HardwareAddr.String(),
+		health:           health,
+		portType:         "veth",
 	}
 	return nil
 }
@@ -130,7 +147,7 @@ func (vsp *mrvlVspServer) CleanVethPairs() error {
 		deviceStore := vsp.deviceStore
 		vsp.deviceStore = nil
 		for _, mrvlDeviceInfo := range deviceStore {
-			nfLink, err := netlink.LinkByName(mrvlDeviceInfo.nfInterfaceName)
+			nfLink, err := netlink.LinkByName(mrvlDeviceInfo.secInterfaceName)
 			if err != nil {
 				klog.Errorf("Error occurred in getting Link By Name: %v", err)
 				errResult = errors.Join(errResult, err)
@@ -141,7 +158,7 @@ func (vsp *mrvlVspServer) CleanVethPairs() error {
 				errResult = errors.Join(errResult, err)
 				continue
 			}
-			klog.Infof("Deleted Veth Pair: %s", mrvlDeviceInfo.nfInterfaceName)
+			klog.Infof("Deleted Veth Pair: %s", mrvlDeviceInfo.secInterfaceName)
 		}
 	}
 	return errResult
@@ -174,16 +191,16 @@ func (vsp *mrvlVspServer) ConfigureNetworkInterface() error {
 		return errors.New("invalid Port Type")
 	}
 	for nfMacAddress, mrvlDeviceInfo := range vsp.deviceStore {
-		klog.Infof("nfMacAddress: %s, nfInterfaceName: %s, dpInterfaceName: %s, dpMacAddress: %s, health: %s", nfMacAddress, mrvlDeviceInfo.nfInterfaceName, mrvlDeviceInfo.dpInterfaceName, mrvlDeviceInfo.dpMAC, mrvlDeviceInfo.health)
+		klog.Infof("nfMacAddress: %s, secInterfaceName: %s, dpInterfaceName: %s, dpMacAddress: %s, health: %s", nfMacAddress, mrvlDeviceInfo.secInterfaceName, mrvlDeviceInfo.dpInterfaceName, mrvlDeviceInfo.dpMAC, mrvlDeviceInfo.health)
 	}
 	return nil
 }
 
-// GetDeviceHealth function to get the health of the device based on the given nfInterfaceName
-func (vsp *mrvlVspServer) GetDeviceHealth(nfInterfaceName string) string {
+// GetDeviceHealth function to get the health of the device based on the given secInterfaceName
+func (vsp *mrvlVspServer) GetDeviceHealth(secInterfaceName string) string {
 	switch vsp.portType {
-	case "veth":
-		nfLink, err := netlink.LinkByName(nfInterfaceName)
+	case "veth", "sriov":
+		nfLink, err := netlink.LinkByName(secInterfaceName)
 		if err != nil {
 			return "Unhealthy"
 		}
@@ -205,10 +222,10 @@ func (vsp *mrvlVspServer) Init(ctx context.Context, in *pb.InitRequest) (*pb.IpP
 	klog.Infof("Received Init() request: DpuMode: %v", in.DpuMode)
 	vsp.isDPUMode = in.DpuMode
 	ipPort, err := vsp.configureIP(in.DpuMode)
+	if vsp.deviceStore == nil {
+		vsp.deviceStore = make(map[string]mrvlDeviceInfo)
+	}
 	if vsp.isDPUMode {
-		if vsp.deviceStore == nil {
-			vsp.deviceStore = make(map[string]mrvlDeviceInfo)
-		}
 		err := vsp.ConfigureNetworkInterface()
 		if err != nil {
 			klog.Errorf("Error occurred in configuring Network Interface: %v", err)
@@ -223,6 +240,20 @@ func (vsp *mrvlVspServer) Init(ctx context.Context, in *pb.InitRequest) (*pb.IpP
 			return &pb.IpPort{}, err
 		}
 
+	} else {
+		vsp.portType = "sriov"
+		VfsPCI, err := mrvlutils.GetAllVfsByDeviceID(HostVFDeviceID)
+		if err != nil {
+			return nil, err
+		}
+		for _, vfpci := range VfsPCI {
+			health := vsp.GetDeviceHealth(vfpci)
+			vsp.deviceStore[vfpci] = mrvlDeviceInfo{
+				pciAddress: vfpci,
+				health:     health,
+				portType:   "sriov",
+			}
+		}
 	}
 	return &pb.IpPort{
 		Ip:   ipPort.Ip,
@@ -348,11 +379,19 @@ func (vsp *mrvlVspServer) GetDevices(ctx context.Context, in *pb.Empty) (*pb.Dev
 	if vsp.deviceStore == nil {
 		return nil, errors.New("device Store is empty")
 	}
-	for _, mrvlDeviceInfo := range vsp.deviceStore {
-		health := vsp.GetDeviceHealth(mrvlDeviceInfo.nfInterfaceName)
-		devices[mrvlDeviceInfo.nfInterfaceName] = &pb.Device{
-			ID:     mrvlDeviceInfo.nfInterfaceName,
-			Health: health,
+	if vsp.isDPUMode {
+		for _, mrvlDeviceInfo := range vsp.deviceStore {
+			devices[mrvlDeviceInfo.secInterfaceName] = &pb.Device{
+				ID:     mrvlDeviceInfo.secInterfaceName,
+				Health: mrvlDeviceInfo.health,
+			}
+		}
+	} else {
+		for _, mrvlDeviceInfo := range vsp.deviceStore {
+			devices[mrvlDeviceInfo.pciAddress] = &pb.Device{
+				ID:     mrvlDeviceInfo.pciAddress,
+				Health: mrvlDeviceInfo.health,
+			}
 		}
 	}
 	return &pb.DeviceListResponse{
@@ -441,6 +480,12 @@ func enableIPV6LinkLocal(interfaceName string, ipv6Addr string) error {
 		klog.Infof("nmcli device set %s managed no failed with error %v", interfaceName, err1)
 	}
 
+	optimistic_dad_file := "/proc/sys/net/ipv6/conf/" + interfaceName + "/optimistic_dad"
+	err1 = os.WriteFile(optimistic_dad_file, []byte("1"), os.ModeAppend)
+	if err1 != nil {
+		klog.Errorf("Error setting %s: %v", optimistic_dad_file, err1)
+	}
+
 	// Ensure to set addrgenmode and toggle link state (which can result in creating
 	// the IPv6 link local address. Ignore errors here.
 	exec.Command("ip", "link", "set", interfaceName, "addrgenmode", "eui64").Run()
@@ -451,7 +496,7 @@ func enableIPV6LinkLocal(interfaceName string, ipv6Addr string) error {
 		return fmt.Errorf("Error setting link %s up: %v", interfaceName, err)
 	}
 
-	err = exec.Command("ip", "addr", "replace", ipv6Addr+"/64", "dev", interfaceName).Run()
+	err = exec.Command("ip", "addr", "replace", ipv6Addr+"/64", "dev", interfaceName, "optimistic").Run()
 	if err != nil {
 		return fmt.Errorf("Error configuring IPv6 address %s/64 on link %s: %v", ipv6Addr, interfaceName, err)
 	}
