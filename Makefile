@@ -269,7 +269,7 @@ docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
 GO_CONTAINER_CACHE = /tmp/dpu-operator-cache
-REGISTRY ?= $(shell hostname)
+REGISTRY ?= $(shell hostname | tr A-Z a-z).jf.intel.com
 # Use the image urls from the yaml that is used with Kustomize for local
 # development.
 DPU_OPERATOR_IMAGE := $(REGISTRY):5000/dpu-operator:dev
@@ -324,7 +324,7 @@ go-cache: ## Build all container images necessary to run the whole operator
 
 ## Build all container images necessary to run the whole operator
 .PHONY: local-buildx
-local-buildx: prepare-multi-arch go-cache local-buildx-manager local-buildx-daemon local-buildx-marvell-vsp local-buildx-intel-vsp local-buildx-network-resources-injector
+local-buildx: prepare-multi-arch go-cache local-buildx-manager local-buildx-daemon local-buildx-intel-vsp local-buildx-network-resources-injector
 	@echo "local-buildx completed"
 
 define build_image
@@ -401,7 +401,7 @@ incremental-local-buildx: prepare-multi-arch go-cache incremental-prep-local-dep
 local-pushx-incremental: ## Push all container images necessary to run the whole operator
 	buildah manifest push --all $(DPU_OPERATOR_IMAGE)-manifest docker://$(DPU_OPERATOR_IMAGE)
 	buildah manifest push --all $(DPU_DAEMON_IMAGE)-manifest docker://$(DPU_DAEMON_IMAGE)
-	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)
+#	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)
 	buildah manifest push --all $(INTEL_VSP_IMAGE)-manifest docker://$(INTEL_VSP_IMAGE)
 	buildah manifest push --all $(NETWORK_RESOURCES_INJECTOR_IMAGE)-manifest docker://$(INTEL_VSP_IMAGE)
 
@@ -409,12 +409,11 @@ local-pushx-incremental: ## Push all container images necessary to run the whole
 local-pushx: ## Push all container images necessary to run the whole operator
 	buildah manifest push --all $(DPU_OPERATOR_IMAGE)-manifest docker://$(DPU_OPERATOR_IMAGE)
 	buildah manifest push --all $(DPU_DAEMON_IMAGE)-manifest docker://$(DPU_DAEMON_IMAGE)
-	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)
 	buildah manifest push --all $(INTEL_VSP_IMAGE)-manifest docker://$(INTEL_VSP_IMAGE)
 	buildah manifest push --all $(NETWORK_RESOURCES_INJECTOR_IMAGE)-manifest docker://$(NETWORK_RESOURCES_INJECTOR_IMAGE)
 	buildah manifest push --all $(DPU_OPERATOR_IMAGE)-manifest docker://$(DPU_OPERATOR_IMAGE)-base
 	buildah manifest push --all $(DPU_DAEMON_IMAGE)-manifest docker://$(DPU_DAEMON_IMAGE)-base
-	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)-base
+#	buildah manifest push --all $(MARVELL_VSP_IMAGE)-manifest docker://$(MARVELL_VSP_IMAGE)-base
 	buildah manifest push --all $(INTEL_VSP_IMAGE)-manifest docker://$(INTEL_VSP_IMAGE)-base
 	buildah manifest push --all $(NETWORK_RESOURCES_INJECTOR_IMAGE)-manifest docker://$(NETWORK_RESOURCES_INJECTOR_IMAGE)-base
 
